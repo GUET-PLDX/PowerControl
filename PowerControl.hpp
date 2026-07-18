@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===

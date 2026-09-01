@@ -18,7 +18,6 @@ depends:
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +26,7 @@ depends:
 #include "RLS.hpp"
 #include "SuperPower.hpp"
 #include "app_framework.hpp"
+#include "flag.hpp"
 #include "libxr_def.hpp"
 #include "mutex.hpp"
 #include "pid.hpp"
@@ -360,7 +360,7 @@ class PowerControl : public LibXR::Application {
 
   /** @brief 执行一次完整的同步功率控制周期。 */
   void OutputLimit() {
-    if (cycle_active_.test_and_set(std::memory_order_acquire)) {
+    if (cycle_active_.TestAndSet()) {
       return;
     }
     const uint32_t CURRENT_TIMESTAMP_MS =
@@ -372,7 +372,7 @@ class PowerControl : public LibXR::Application {
     }
     SnapshotInputs();
     ProcessCycle(telemetry, CYCLE_TIME_S, CURRENT_TIMESTAMP_MS);
-    cycle_active_.clear(std::memory_order_release);
+    cycle_active_.Clear();
   }
 
   PowerControlData GetPowerControlData() const {
@@ -1187,7 +1187,7 @@ class PowerControl : public LibXR::Application {
   }
 
   mutable LibXR::Mutex data_mutex_;
-  std::atomic_flag cycle_active_ = ATOMIC_FLAG_INIT;
+  LibXR::Flag::Atomic cycle_active_{};
   SuperPower* superpower_;
   LibXR::PID<float> base_energy_pid_;
   LibXR::PID<float> full_energy_pid_;

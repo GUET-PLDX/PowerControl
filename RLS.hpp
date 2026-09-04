@@ -164,14 +164,12 @@ class RLS {
       return false;
     }
 
-    const Matrix ATTENUATION =
-        Matrix::Identity() - EFFECTIVE_GAIN * FREE_SAMPLE.transpose();
     const Matrix RETAINED_BLOCKED_COVARIANCE =
         (BLOCKED_SELECTOR * covariance_ * BLOCKED_SELECTOR).eval();
     Matrix candidate_covariance =
-        (ATTENUATION * FREE_COVARIANCE * ATTENUATION.transpose()) /
+        (FREE_COVARIANCE -
+         EFFECTIVE_GAIN * FREE_SAMPLE.transpose() * FREE_COVARIANCE) /
             forgetting_factor_ +
-        EFFECTIVE_GAIN * EFFECTIVE_GAIN.transpose() +
         RETAINED_BLOCKED_COVARIANCE;
     candidate_covariance =
         (0.5f * (candidate_covariance + candidate_covariance.transpose()))

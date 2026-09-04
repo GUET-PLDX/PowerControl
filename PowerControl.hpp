@@ -6,7 +6,8 @@ module_name: PowerControl
 module_description: RM2024 chassis power control with internal energy budget
 constructor_args:
   - superpower: '@&superpower'
-  - chassis_static_power_loss: 3.5
+  - chassis_static_power_loss: 2.78
+  - reduction_ratio_3508: 19.0
   - motor_count_3508: 4
   - motor_count_6020: 0
 template_args: []
@@ -27,10 +28,12 @@ depends:
 #include "SuperPower.hpp"
 #include "app_framework.hpp"
 #include "flag.hpp"
+#include "libxr_cb.hpp"
 #include "libxr_def.hpp"
 #include "mutex.hpp"
 #include "pid.hpp"
 #include "timebase.hpp"
+#include "timer.hpp"
 
 inline constexpr int POWER_CONTROL_MAX_MOTOR_COUNT = 6;
 inline constexpr std::size_t POWER_CONTROL_MAX_TOTAL_MOTOR_COUNT = 12U;
@@ -41,6 +44,7 @@ inline constexpr float M3508_COMMAND_TO_TORQUE_NM_PER_LSB =
     0.0156224f * 20.0f / 16384.0f;
 inline constexpr float GM6020_COMMAND_TO_TORQUE_NM_PER_LSB =
     0.741f * 3.0f / 16384.0f;
+inline constexpr float POWER_CONTROL_M3508_REDUCTION_RATIO = 19.0f;
 
 /** @brief 功率数据源降级原因。 */
 enum class DegradationReason {
@@ -232,7 +236,8 @@ class PowerControl : public LibXR::Application {
   };
 
   PowerControl(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-               SuperPower* superpower, float chassis_static_power_loss = 3.5f,
+               SuperPower* superpower, float chassis_static_power_loss = 2.78f,
+               float reduction_ratio_3508 = POWER_CONTROL_M3508_REDUCTION_RATIO,
                int motor_count_3508 = 4, int motor_count_6020 = 0)
       : superpower_(superpower),
         base_energy_pid_(MakeEnergyPidParam()),
@@ -240,7 +245,8 @@ class PowerControl : public LibXR::Application {
         rls_(RLS_INITIAL_COVARIANCE, RLS_FORGETTING_FACTOR,
              {DEFAULT_SPEED_LOSS, DEFAULT_TORQUE_SQUARE_LOSS}),
         chassis_static_power_loss_(
-            NonnegativeOr(chassis_static_power_loss, 3.5f)),
+            NonnegativeOr(chassis_static_power_loss, 2.78f)),
+        reduction_ratio_3508_(reduction_ratio_3508),
         motor_count_config_valid_(
             MotorCountConfigValid(motor_count_3508, motor_count_6020)),
         motor_count_3508_(motor_count_config_valid_
@@ -255,6 +261,14 @@ class PowerControl : public LibXR::Application {
     UNUSED(app);
     rls_.SetParamBounds({RLS_SPEED_LOSS_MIN, RLS_TORQUE_LOSS_MIN},
                         {RLS_SPEED_LOSS_MAX, RLS_TORQUE_LOSS_MAX});
+    cached_budget_.effective_budget_w = SENTRY_OFFLINE_POWER_LIMIT_W;
+    cached_budget_.degradation_reason = DegradationReason::BOTH_OFFLINE;
+    cached_model_speed_loss_ = DEFAULT_SPEED_LOSS;
+    cached_model_torque_square_loss_ = DEFAULT_TORQUE_SQUARE_LOSS;
+    timer_handle_ =
+        LibXR::Timer::CreateTask(BackgroundTask, this, BACKGROUND_PERIOD_MS);
+    LibXR::Timer::Add(timer_handle_);
+    LibXR::Timer::Start(timer_handle_);
   }
 
   bool SetMotorData3508(const float* requested_command_lsb,
@@ -358,20 +372,23 @@ class PowerControl : public LibXR::Application {
                                     : PowerRequest::NORMAL);
   }
 
+  void SetMaxPowerConfigured(float max_power_w) {
+    LibXR::Mutex::LockGuard lock(data_mutex_);
+    user_configured_max_power_w_ = max_power_w;
+  }
+
+  void RegisterPowerCallback(LibXR::Callback<float&> callback) {
+    LibXR::Mutex::LockGuard lock(data_mutex_);
+    power_callback_ = callback;
+  }
+
   /** @brief 执行一次完整的同步功率控制周期。 */
   void OutputLimit() {
     if (cycle_active_.TestAndSet()) {
       return;
     }
-    const uint32_t CURRENT_TIMESTAMP_MS =
-        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    const float CYCLE_TIME_S = CalculateCycleTimeSeconds(CURRENT_TIMESTAMP_MS);
-    SuperPower::TelemetrySnapshot telemetry{};
-    if (superpower_ != nullptr) {
-      telemetry = superpower_->GetTelemetrySnapshot();
-    }
-    SnapshotInputs();
-    ProcessCycle(telemetry, CYCLE_TIME_S, CURRENT_TIMESTAMP_MS);
+    SnapshotInputs(workspace_, false);
+    ProcessCycle();
     cycle_active_.Clear();
   }
 
@@ -404,22 +421,20 @@ class PowerControl : public LibXR::Application {
   static constexpr float MAX_ALLOCATION_WEIGHT = 10.0f;
   static constexpr float MAX_ROTOR_RPM = 100000.0f;
   static constexpr float MAX_TRACKING_ERROR = 1000000.0f;
-  static constexpr float POWER_MARGIN_W = 4.0f;
   static constexpr float CAP_FULL_TARGET_RAW = 230.0f;
   static constexpr float CAP_BASE_TARGET_RAW = 30.0f;
   static constexpr float REFEREE_FULL_TARGET_J = 60.0f;
   static constexpr float REFEREE_BASE_TARGET_J = 50.0f;
   static constexpr float MAX_EXTRA_CAP_POWER_W = 300.0f;
-  static constexpr float MINIMUM_POWER_FRACTION = 0.8f;
   static constexpr float BOTH_OFFLINE_POWER_FRACTION = 0.85f;
-  static constexpr float REFEREE_LIMIT_MIN_W = 45.0f;
+  static constexpr float REFEREE_LIMIT_MIN_W = 43.0f;
   static constexpr float REFEREE_LIMIT_MAX_W = 120.0f;
   static constexpr float CONSERVATIVE_FALLBACK_LIMIT_W = 60.0f;
   static constexpr float ENERGY_PROPORTIONAL_GAIN = 50.0f;
   static constexpr float ENERGY_DERIVATIVE_GAIN = 0.2f;
   static constexpr float DEFAULT_CONTROL_PERIOD_S = 0.001f;
-  static constexpr float RLS_INITIAL_COVARIANCE = 1000.0f;
-  static constexpr float RLS_FORGETTING_FACTOR = 0.9999f;
+  static constexpr float RLS_INITIAL_COVARIANCE = 1.0e-5f;
+  static constexpr float RLS_FORGETTING_FACTOR = 0.99999f;
   static constexpr float RLS_MIN_SUM_ABS_OMEGA = 20.0f;
   static constexpr float RLS_MIN_SUM_TAU_SQUARED = 0.02f;
   static constexpr float RLS_MIN_INNOVATION_LIMIT_W = 30.0f;
@@ -438,12 +453,16 @@ class PowerControl : public LibXR::Application {
   static constexpr float AUDIT_RELATIVE_TOLERANCE = 0.001f;
   static constexpr float AUDIT_CONTRACTION_FACTOR = 0.9f;
   static constexpr std::size_t MAX_AUDIT_ITERATIONS = 8U;
+  static constexpr float MINIMUM_CONFIGURED_POWER_W = 23.0f;
+  static constexpr float SENTRY_OFFLINE_POWER_LIMIT_W = 100.0f;
+  static constexpr uint32_t BACKGROUND_PERIOD_MS = 1U;
 
   struct MotorModel {
     float command_to_torque_nm_per_lsb;
     float speed_loss;
     float torque_square_loss;
     float max_command;
+    float speed_scale;
   };
 
   struct MotorInput {
@@ -455,7 +474,7 @@ class PowerControl : public LibXR::Application {
 
   struct MotorSample : MotorInput {
     MotorModel model{M3508_COMMAND_TO_TORQUE_NM_PER_LSB, DEFAULT_SPEED_LOSS,
-                     DEFAULT_TORQUE_SQUARE_LOSS, DEFAULT_MAX_COMMAND};
+                     DEFAULT_TORQUE_SQUARE_LOSS, DEFAULT_MAX_COMMAND, 1.0f};
     float allocation_weight_scale = 1.0f;
     float reserve_weight = 0.0f;
   };
@@ -493,6 +512,12 @@ class PowerControl : public LibXR::Application {
     std::array<float, POWER_CONTROL_MAX_TOTAL_MOTOR_COUNT> quotas{};
     std::array<float, POWER_CONTROL_MAX_TOTAL_MOTOR_COUNT> residual_capacity{};
     std::array<float, POWER_CONTROL_MAX_TOTAL_MOTOR_COUNT> weights{};
+    float reduction_ratio_3508 = POWER_CONTROL_M3508_REDUCTION_RATIO;
+    float m3508_speed_loss = DEFAULT_SPEED_LOSS;
+    float m3508_torque_square_loss = DEFAULT_TORQUE_SQUARE_LOSS;
+    BudgetStatus cached_budget{};
+    SuperPower::TelemetrySnapshot telemetry{};
+    bool rls_updated = false;
     PowerControlData output{};
   };
 
@@ -577,15 +602,15 @@ class PowerControl : public LibXR::Application {
     return true;
   }
 
-  MotorModel Make3508Model() const {
-    const RLS<2>::ParamVector& params = rls_.GetParamVector();
-    return {M3508_COMMAND_TO_TORQUE_NM_PER_LSB, params[0], params[1],
-            DEFAULT_MAX_COMMAND};
+  static MotorModel Make3508Model(const Workspace& workspace) {
+    return {M3508_COMMAND_TO_TORQUE_NM_PER_LSB * workspace.reduction_ratio_3508,
+            workspace.m3508_speed_loss, workspace.m3508_torque_square_loss,
+            DEFAULT_MAX_COMMAND, 1.0f / workspace.reduction_ratio_3508};
   }
 
   static MotorModel Make6020Model() {
     return {GM6020_COMMAND_TO_TORQUE_NM_PER_LSB, DEFAULT_SPEED_LOSS,
-            DEFAULT_TORQUE_SQUARE_LOSS, DEFAULT_MAX_COMMAND};
+            DEFAULT_TORQUE_SQUARE_LOSS, DEFAULT_MAX_COMMAND, 1.0f};
   }
 
   static MotorSample MakeMotorSample(const MotorInput& input,
@@ -615,38 +640,49 @@ class PowerControl : public LibXR::Application {
     return calculate_motor_model_power(
         std::clamp(command_lsb, -sample.model.max_command,
                    sample.model.max_command),
-        sample.rotor_rpm, sample.model.command_to_torque_nm_per_lsb,
-        sample.model.speed_loss, sample.model.torque_square_loss);
+        sample.rotor_rpm * sample.model.speed_scale,
+        sample.model.command_to_torque_nm_per_lsb, sample.model.speed_loss,
+        sample.model.torque_square_loss);
   }
 
   static float SolveCommand(const MotorSample& sample, float quota_w) {
     return solve_current_for_power(
-        quota_w, sample.rotor_rpm, sample.model.command_to_torque_nm_per_lsb,
-        sample.model.speed_loss, sample.model.torque_square_loss,
-        sample.command_lsb, sample.model.max_command);
+        quota_w, sample.rotor_rpm * sample.model.speed_scale,
+        sample.model.command_to_torque_nm_per_lsb, sample.model.speed_loss,
+        sample.model.torque_square_loss, sample.command_lsb,
+        sample.model.max_command);
   }
 
-  void SnapshotInputs() {
+  void SnapshotInputs(Workspace& workspace, bool consume_feedback) {
     LibXR::Mutex::LockGuard lock(data_mutex_);
-    workspace_.requested_3508 = requested_samples_3508_;
-    workspace_.requested_6020 = requested_samples_6020_;
-    workspace_.feedback_3508 = feedback_samples_3508_;
-    workspace_.feedback_6020 = feedback_samples_6020_;
-    workspace_.allocation_bias = allocation_bias_3508_;
-    workspace_.motor_count_3508 = motor_count_3508_;
-    workspace_.motor_count_6020 = motor_count_6020_;
-    workspace_.motor_count_config_valid = motor_count_config_valid_;
-    workspace_.requested_valid_3508 = requested_valid_3508_;
-    workspace_.requested_valid_6020 = requested_valid_6020_;
-    workspace_.feedback_pending =
+    workspace.requested_3508 = requested_samples_3508_;
+    workspace.requested_6020 = requested_samples_6020_;
+    workspace.feedback_3508 = feedback_samples_3508_;
+    workspace.feedback_6020 = feedback_samples_6020_;
+    workspace.allocation_bias = allocation_bias_3508_;
+    workspace.motor_count_3508 = motor_count_3508_;
+    workspace.motor_count_6020 = motor_count_6020_;
+    workspace.motor_count_config_valid = motor_count_config_valid_;
+    workspace.requested_valid_3508 = requested_valid_3508_;
+    workspace.requested_valid_6020 = requested_valid_6020_;
+    workspace.feedback_pending =
         feedback_ready_3508_ &&
         (motor_count_6020_ == 0U || feedback_ready_6020_);
-    workspace_.requested_mode = requested_mode_;
-    feedback_ready_3508_ = false;
-    feedback_ready_6020_ = false;
+    workspace.requested_mode = requested_mode_;
+    workspace.reduction_ratio_3508 = reduction_ratio_3508_;
+    workspace.m3508_speed_loss = cached_model_speed_loss_;
+    workspace.m3508_torque_square_loss = cached_model_torque_square_loss_;
+    workspace.cached_budget = cached_budget_;
+    workspace.telemetry = cached_telemetry_;
+    workspace.rls_updated = rls_updated_cache_;
+    if (consume_feedback) {
+      feedback_ready_3508_ = false;
+      feedback_ready_6020_ = false;
+    }
   }
 
-  bool UpdatePowerModel(const SuperPower::TelemetrySnapshot& telemetry,
+  bool UpdatePowerModel(Workspace& workspace,
+                        const SuperPower::TelemetrySnapshot& telemetry,
                         uint32_t current_timestamp_ms) {
     ExpireInnovationRecovery(current_timestamp_ms);
     const bool CAP_USABLE =
@@ -657,14 +693,14 @@ class PowerControl : public LibXR::Application {
     if (!CAP_USABLE || !std::isfinite(telemetry.chassis_power_w)) {
       return false;
     }
-    if (!workspace_.feedback_pending || !NEW_POWER_SAMPLE) {
+    if (!workspace.feedback_pending || !NEW_POWER_SAMPLE) {
       return false;
     }
 
     last_rls_power_sample_sequence_ = telemetry.chassis_power_sequence;
     rls_power_sample_consumed_ = true;
-    if (!AllActive(workspace_.feedback_3508, workspace_.motor_count_3508) ||
-        !AllActive(workspace_.feedback_6020, workspace_.motor_count_6020)) {
+    if (!AllActive(workspace.feedback_3508, workspace.motor_count_3508) ||
+        !AllActive(workspace.feedback_6020, workspace.motor_count_6020)) {
       return false;
     }
     if (telemetry.chassis_power_w < RLS_MEASURED_POWER_MIN_W ||
@@ -672,28 +708,28 @@ class PowerControl : public LibXR::Application {
       return false;
     }
 
-    const MotorModel M3508_MODEL = Make3508Model();
+    const MotorModel M3508_MODEL = Make3508Model(workspace);
     const MotorModel GM6020_MODEL = Make6020Model();
     float sum_abs_omega = 0.0f;
     float sum_tau_squared = 0.0f;
     float mechanical_power_w = 0.0f;
     float fixed_group_power_w = 0.0f;
-    for (std::size_t index = 0U; index < workspace_.motor_count_3508; ++index) {
-      const MotorInput& sample = workspace_.feedback_3508[index];
+    for (std::size_t index = 0U; index < workspace.motor_count_3508; ++index) {
+      const MotorInput& sample = workspace.feedback_3508[index];
       if (!sample.active) {
         continue;
       }
       const float TAU =
           sample.command_lsb * M3508_MODEL.command_to_torque_nm_per_lsb;
-      const float OMEGA =
-          sample.rotor_rpm * POWER_CONTROL_RPM_TO_RAD_PER_SECOND;
+      const float OMEGA = sample.rotor_rpm * M3508_MODEL.speed_scale *
+                          POWER_CONTROL_RPM_TO_RAD_PER_SECOND;
       sum_abs_omega += std::fabs(OMEGA);
       sum_tau_squared += TAU * TAU;
       mechanical_power_w += TAU * OMEGA;
     }
-    for (std::size_t index = 0U; index < workspace_.motor_count_6020; ++index) {
+    for (std::size_t index = 0U; index < workspace.motor_count_6020; ++index) {
       MotorSample sample =
-          MakeMotorSample(workspace_.feedback_6020[index], GM6020_MODEL);
+          MakeMotorSample(workspace.feedback_6020[index], GM6020_MODEL);
       fixed_group_power_w += PredictMotorPower(sample, sample.command_lsb);
     }
 
@@ -791,6 +827,7 @@ class PowerControl : public LibXR::Application {
   }
 
   BudgetStatus CalculatePowerBudget(
+      const Workspace& workspace,
       const SuperPower::TelemetrySnapshot& telemetry, float cycle_time_s) {
     const bool CAP_USABLE =
         telemetry.supercap_online && telemetry.supercap_healthy;
@@ -818,15 +855,16 @@ class PowerControl : public LibXR::Application {
 
     BudgetStatus status{};
     const float REFEREE_LIMIT_TO_USE =
-        !has_valid_referee_limit_
-            ? REFEREE_LIMIT_MIN_W
-            : (INVALID_REFEREE_LIMIT ? std::min(latest_referee_limit_w_,
-                                                CONSERVATIVE_FALLBACK_LIMIT_W)
-                                     : latest_referee_limit_w_);
+        INVALID_REFEREE_LIMIT
+            ? (has_valid_referee_limit_
+                   ? std::min(latest_referee_limit_w_,
+                              CONSERVATIVE_FALLBACK_LIMIT_W)
+                   : CONSERVATIVE_FALLBACK_LIMIT_W)
+            : (has_valid_referee_limit_ ? latest_referee_limit_w_
+                                        : SENTRY_OFFLINE_POWER_LIMIT_W);
     const bool EXTRA_POWER_ALLOWED =
         has_valid_referee_limit_ && !INVALID_REFEREE_LIMIT;
-    const float MINIMUM_CONFIGURED_POWER =
-        REFEREE_LIMIT_TO_USE * MINIMUM_POWER_FRACTION;
+    const float MINIMUM_CONFIGURED_POWER = MINIMUM_CONFIGURED_POWER_W;
     status.degradation_reason = DetermineDegradation(
         CAP_USABLE, REFEREE_POWER_LIMIT_ONLINE, REFEREE_ENERGY_BUFFER_ONLINE,
         INVALID_REFEREE_LIMIT);
@@ -880,13 +918,13 @@ class PowerControl : public LibXR::Application {
         std::swap(full_bound, base_bound);
       }
       const float REQUESTED_POWER =
-          workspace_.requested_mode == PowerRequest::BOOST
+          workspace.requested_mode == PowerRequest::BOOST
               ? upper_request
               : REFEREE_LIMIT_TO_USE;
       const float ENERGY_CONSTRAINED_BUDGET =
           std::clamp(REQUESTED_POWER, full_bound, base_bound);
       const bool EXTRA_POWER_REQUESTED =
-          workspace_.requested_mode == PowerRequest::BOOST;
+          workspace.requested_mode == PowerRequest::BOOST;
       effective_budget =
           EXTRA_POWER_ALLOWED && EXTRA_POWER_REQUESTED
               ? ENERGY_CONSTRAINED_BUDGET
@@ -895,13 +933,27 @@ class PowerControl : public LibXR::Application {
 
     effective_budget =
         NonnegativeOr(effective_budget, CONSERVATIVE_FALLBACK_LIMIT_W);
+    float configured_limit = 0.0f;
+    LibXR::Callback<float&> power_callback;
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      configured_limit = user_configured_max_power_w_;
+      power_callback = power_callback_;
+    }
+    if (!power_callback.Empty()) {
+      configured_limit = 0.0f;
+      power_callback.Run(false, configured_limit);
+    }
+    if (std::isfinite(configured_limit) && configured_limit > 0.0f) {
+      effective_budget = std::min(effective_budget, configured_limit);
+    }
     status.effective_budget_w = effective_budget;
     return status;
   }
 
   void PrepareMotorSamples() {
     workspace_.samples = {};
-    const MotorModel M3508_MODEL = Make3508Model();
+    const MotorModel M3508_MODEL = Make3508Model(workspace_);
     const MotorModel GM6020_MODEL = Make6020Model();
     for (std::size_t index = 0U; index < workspace_.motor_count_3508; ++index) {
       workspace_.samples[index] =
@@ -1123,13 +1175,84 @@ class PowerControl : public LibXR::Application {
     }
   }
 
-  void ProcessCycle(const SuperPower::TelemetrySnapshot& telemetry,
-                    float cycle_time_s, uint32_t current_timestamp_ms) {
-    const bool RLS_UPDATED = UpdatePowerModel(telemetry, current_timestamp_ms);
+  static void BackgroundTask(PowerControl* self) { self->BackgroundUpdate(); }
+
+  void BackgroundUpdate() {
+    const uint32_t NOW_MS =
+        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    const float CYCLE_TIME_S = CalculateCycleTimeSeconds(NOW_MS);
+    SuperPower::TelemetrySnapshot telemetry{};
+    if (superpower_ != nullptr) {
+      telemetry = superpower_->GetTelemetrySnapshot();
+    }
+
+    SnapshotInputs(background_workspace_, true);
+    const bool RLS_UPDATED =
+        UpdatePowerModel(background_workspace_, telemetry, NOW_MS);
     const BudgetStatus BUDGET_STATUS =
-        CalculatePowerBudget(telemetry, cycle_time_s);
+        CalculatePowerBudget(background_workspace_, telemetry, CYCLE_TIME_S);
+
+    estimated_power_w_ = chassis_static_power_loss_;
+    const MotorModel M3508_MODEL = Make3508Model(background_workspace_);
+    const MotorModel GM6020_MODEL = Make6020Model();
+    for (std::size_t index = 0U; index < background_workspace_.motor_count_3508;
+         ++index) {
+      estimated_power_w_ += PredictMotorPower(
+          MakeMotorSample(background_workspace_.feedback_3508[index],
+                          M3508_MODEL),
+          background_workspace_.feedback_3508[index].command_lsb);
+    }
+    for (std::size_t index = 0U; index < background_workspace_.motor_count_6020;
+         ++index) {
+      estimated_power_w_ += PredictMotorPower(
+          MakeMotorSample(background_workspace_.feedback_6020[index],
+                          GM6020_MODEL),
+          background_workspace_.feedback_6020[index].command_lsb);
+    }
+
+    if (telemetry.supercap_online && telemetry.supercap_healthy) {
+      estimated_cap_energy_j_ = std::clamp(
+          static_cast<float>(telemetry.cap_energy_raw) / 255.0f * 2100.0f, 0.0f,
+          2100.0f);
+    } else if (telemetry.referee_energy_buffer_online) {
+      const float BUFFER =
+          static_cast<float>(telemetry.referee_energy_buffer_j);
+      if (BUFFER < REFEREE_FULL_TARGET_J && telemetry.chassis_power_w > 43.0f) {
+        estimated_cap_energy_j_ = 0.0f;
+      } else if (BUFFER >= REFEREE_FULL_TARGET_J &&
+                 telemetry.chassis_power_w < MINIMUM_CONFIGURED_POWER_W) {
+        estimated_cap_energy_j_ = 2100.0f;
+      } else {
+        estimated_cap_energy_j_ = std::clamp(
+            estimated_cap_energy_j_ +
+                (telemetry.chassis_power_w - estimated_power_w_) * CYCLE_TIME_S,
+            0.0f, 2100.0f);
+      }
+    } else {
+      estimated_cap_energy_j_ = std::clamp(
+          estimated_cap_energy_j_ + (37.0f - estimated_power_w_) * CYCLE_TIME_S,
+          0.0f, 2100.0f);
+    }
+
+    telemetry.cap_energy_normalized = estimated_cap_energy_j_ / 2100.0f;
+    telemetry.cap_energy_raw = static_cast<uint8_t>(
+        std::clamp(estimated_cap_energy_j_ / 2100.0f * 255.0f, 0.0f, 255.0f));
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      cached_budget_ = BUDGET_STATUS;
+      cached_telemetry_ = telemetry;
+      const RLS<2>::ParamVector& PARAMS = rls_.GetParamVector();
+      cached_model_speed_loss_ = PARAMS[0];
+      cached_model_torque_square_loss_ = PARAMS[1];
+      rls_updated_cache_ = RLS_UPDATED;
+    }
+  }
+
+  void ProcessCycle() {
+    const SuperPower::TelemetrySnapshot& telemetry = workspace_.telemetry;
+    const BudgetStatus& budget_status = workspace_.cached_budget;
     const float EFFECTIVE_BUDGET =
-        std::max(0.0f, BUDGET_STATUS.effective_budget_w - POWER_MARGIN_W);
+        std::max(0.0f, budget_status.effective_budget_w);
     PrepareMotorSamples();
     workspace_.output = {};
     AllocatePower(EFFECTIVE_BUDGET);
@@ -1156,7 +1279,6 @@ class PowerControl : public LibXR::Application {
       workspace_.output.is_power_limited = true;
     }
 
-    const RLS<2>::ParamVector& params = rls_.GetParamVector();
     workspace_.output.motor_input_valid = REQUEST_INPUT_VALID;
     workspace_.output.measured_power_w =
         std::isfinite(telemetry.chassis_power_w) ? telemetry.chassis_power_w
@@ -1166,8 +1288,9 @@ class PowerControl : public LibXR::Application {
             ? std::clamp(telemetry.cap_energy_normalized, 0.0f, 1.0f)
             : 0.0f;
     workspace_.output.cap_energy_raw = telemetry.cap_energy_raw;
-    workspace_.output.m3508_speed_loss = params[0];
-    workspace_.output.m3508_torque_square_loss = params[1];
+    workspace_.output.m3508_speed_loss = workspace_.m3508_speed_loss;
+    workspace_.output.m3508_torque_square_loss =
+        workspace_.m3508_torque_square_loss;
     workspace_.output.gm6020_speed_loss = DEFAULT_SPEED_LOSS;
     workspace_.output.gm6020_torque_square_loss = DEFAULT_TORQUE_SQUARE_LOSS;
     workspace_.output.supercap_online = telemetry.supercap_online;
@@ -1178,8 +1301,8 @@ class PowerControl : public LibXR::Application {
         telemetry.referee_energy_buffer_online;
     workspace_.output.referee_online = telemetry.referee_power_limit_online &&
                                        telemetry.referee_energy_buffer_online;
-    workspace_.output.rls_updated = RLS_UPDATED;
-    workspace_.output.degradation_reason = BUDGET_STATUS.degradation_reason;
+    workspace_.output.rls_updated = workspace_.rls_updated;
+    workspace_.output.degradation_reason = budget_status.degradation_reason;
     workspace_.output.requested_mode = workspace_.requested_mode;
 
     LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -1189,10 +1312,12 @@ class PowerControl : public LibXR::Application {
   mutable LibXR::Mutex data_mutex_;
   LibXR::Flag::Atomic cycle_active_{};
   SuperPower* superpower_;
+  LibXR::Timer::TimerHandle timer_handle_ = nullptr;
   LibXR::PID<float> base_energy_pid_;
   LibXR::PID<float> full_energy_pid_;
   RLS<2> rls_;
   float chassis_static_power_loss_ = 0.0f;
+  float reduction_ratio_3508_ = POWER_CONTROL_M3508_REDUCTION_RATIO;
   bool motor_count_config_valid_ = false;
   std::size_t motor_count_3508_ = 0U;
   std::size_t motor_count_6020_ = 0U;
@@ -1217,6 +1342,16 @@ class PowerControl : public LibXR::Application {
   uint32_t last_control_timestamp_ms_ = 0U;
   bool control_timestamp_initialized_ = false;
   EnergyFeedbackDomain energy_feedback_domain_ = EnergyFeedbackDomain::NONE;
+  float user_configured_max_power_w_ = 0.0f;
+  LibXR::Callback<float&> power_callback_;
+  BudgetStatus cached_budget_{};
+  SuperPower::TelemetrySnapshot cached_telemetry_{};
+  float cached_model_speed_loss_ = DEFAULT_SPEED_LOSS;
+  float cached_model_torque_square_loss_ = DEFAULT_TORQUE_SQUARE_LOSS;
+  float estimated_cap_energy_j_ = 0.0f;
+  float estimated_power_w_ = 0.0f;
+  bool rls_updated_cache_ = false;
+  Workspace background_workspace_{};
   Workspace workspace_{};
   PowerControlData power_control_data_{};
 };

@@ -32,8 +32,8 @@ depends:
 #include "libxr_def.hpp"
 #include "mutex.hpp"
 #include "pid.hpp"
+#include "thread.hpp"
 #include "timebase.hpp"
-#include "timer.hpp"
 
 inline constexpr int POWER_CONTROL_MAX_MOTOR_COUNT = 6;
 inline constexpr std::size_t POWER_CONTROL_MAX_TOTAL_MOTOR_COUNT = 12U;
@@ -265,10 +265,8 @@ class PowerControl : public LibXR::Application {
     cached_budget_.degradation_reason = DegradationReason::BOTH_OFFLINE;
     cached_model_speed_loss_ = DEFAULT_SPEED_LOSS;
     cached_model_torque_square_loss_ = DEFAULT_TORQUE_SQUARE_LOSS;
-    timer_handle_ =
-        LibXR::Timer::CreateTask(BackgroundTask, this, BACKGROUND_PERIOD_MS);
-    LibXR::Timer::Add(timer_handle_);
-    LibXR::Timer::Start(timer_handle_);
+    thread_.Create(this, ThreadFunc, "PowerTask", 2048,
+                   LibXR::Thread::Priority::MEDIUM);
   }
 
   bool SetMotorData3508(const float* requested_command_lsb,
@@ -1175,7 +1173,23 @@ class PowerControl : public LibXR::Application {
     }
   }
 
-  static void BackgroundTask(PowerControl* self) { self->BackgroundUpdate(); }
+  static void ThreadFunc(PowerControl* self) {
+    auto last_time = LibXR::Timebase::GetMilliseconds();
+    uint32_t last_superpower_ms =
+        static_cast<uint32_t>(last_time) - SuperPower::COMMAND_PERIOD_MS;
+    while (true) {
+      const uint32_t NOW_MS =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      if (self->superpower_ != nullptr &&
+          static_cast<uint32_t>(NOW_MS - last_superpower_ms) >=
+              SuperPower::COMMAND_PERIOD_MS) {
+        self->superpower_->Update();
+        last_superpower_ms = NOW_MS;
+      }
+      self->BackgroundUpdate();
+      self->thread_.SleepUntil(last_time, BACKGROUND_PERIOD_MS);
+    }
+  }
 
   void BackgroundUpdate() {
     const uint32_t NOW_MS =
@@ -1312,7 +1326,7 @@ class PowerControl : public LibXR::Application {
   mutable LibXR::Mutex data_mutex_;
   LibXR::Flag::Atomic cycle_active_{};
   SuperPower* superpower_;
-  LibXR::Timer::TimerHandle timer_handle_ = nullptr;
+  LibXR::Thread thread_;
   LibXR::PID<float> base_energy_pid_;
   LibXR::PID<float> full_energy_pid_;
   RLS<2> rls_;

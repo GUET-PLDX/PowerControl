@@ -541,16 +541,13 @@ class PowerControl : public LibXR::Application {
            motor_count_6020 >= 0 && motor_count_6020 <= MAX_MOTOR_COUNT;
   }
 
-  float CalculateCycleTimeSeconds(uint32_t current_timestamp_ms) {
+  float CalculateCycleTimeSeconds(
+      LibXR::MicrosecondTimestamp current_timestamp) {
     float cycle_time_s = DEFAULT_CONTROL_PERIOD_S;
     if (control_timestamp_initialized_) {
-      const uint32_t ELAPSED_MS =
-          current_timestamp_ms - last_control_timestamp_ms_;
-      if (ELAPSED_MS > 0U) {
-        cycle_time_s = static_cast<float>(ELAPSED_MS) / 1000.0f;
-      }
+      cycle_time_s = (current_timestamp - last_control_timestamp_).ToSecondf();
     }
-    last_control_timestamp_ms_ = current_timestamp_ms;
+    last_control_timestamp_ = current_timestamp;
     control_timestamp_initialized_ = true;
     return std::isfinite(cycle_time_s) && cycle_time_s > 0.0f
                ? cycle_time_s
@@ -1194,7 +1191,8 @@ class PowerControl : public LibXR::Application {
   void BackgroundUpdate() {
     const uint32_t NOW_MS =
         static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    const float CYCLE_TIME_S = CalculateCycleTimeSeconds(NOW_MS);
+    const float CYCLE_TIME_S =
+        CalculateCycleTimeSeconds(LibXR::Timebase::GetMicroseconds());
     SuperPower::TelemetrySnapshot telemetry{};
     if (superpower_ != nullptr) {
       telemetry = superpower_->GetTelemetrySnapshot();
@@ -1353,7 +1351,7 @@ class PowerControl : public LibXR::Application {
   bool persistent_innovation_timestamp_initialized_ = false;
   float latest_referee_limit_w_ = 0.0f;
   bool has_valid_referee_limit_ = false;
-  uint32_t last_control_timestamp_ms_ = 0U;
+  LibXR::MicrosecondTimestamp last_control_timestamp_ = 0;
   bool control_timestamp_initialized_ = false;
   EnergyFeedbackDomain energy_feedback_domain_ = EnergyFeedbackDomain::NONE;
   float user_configured_max_power_w_ = 0.0f;

@@ -2,18 +2,9 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_name: PowerControl
 module_description: RM2024 chassis power control with internal energy budget
-constructor_args:
-  - superpower: '@&superpower'
-  - chassis_static_power_loss: 2.78
-  - reduction_ratio_3508: 19.0
-  - motor_count_3508: 4
-  - motor_count_6020: 0
-template_args: []
-required_hardware: []
 depends:
-  - pldx/SuperPower
+- id: GUET-PLDX/SuperPower
 === END MANIFEST === */
 // clang-format on
 
@@ -26,8 +17,8 @@ depends:
 
 #include "RLS.hpp"
 #include "SuperPower.hpp"
-#include "app_framework.hpp"
 #include "flag.hpp"
+#include "libxr.hpp"
 #include "libxr_cb.hpp"
 #include "libxr_def.hpp"
 #include "mutex.hpp"
@@ -224,7 +215,7 @@ struct PowerControlData {
  * 模块内部计算能量预算、在线辨识损耗参数，并为全部 3508/6020 电机执行一次
  * 共享功率分配。所有工作区均为固定成员，不使用堆内存。
  */
-class PowerControl : public LibXR::Application {
+class PowerControl {
  public:
   static constexpr int MAX_MOTOR_COUNT = POWER_CONTROL_MAX_MOTOR_COUNT;
 
@@ -235,8 +226,7 @@ class PowerControl : public LibXR::Application {
     float allocation_weight_scale[MAX_MOTOR_COUNT] = {};
   };
 
-  PowerControl(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-               SuperPower* superpower, float chassis_static_power_loss = 2.78f,
+  PowerControl(SuperPower* superpower, float chassis_static_power_loss = 2.78f,
                float reduction_ratio_3508 = POWER_CONTROL_M3508_REDUCTION_RATIO,
                int motor_count_3508 = 4, int motor_count_6020 = 0)
       : superpower_(superpower),
@@ -257,8 +247,6 @@ class PowerControl : public LibXR::Application {
                               : 0U),
         requested_valid_3508_(motor_count_3508_ == 0U),
         requested_valid_6020_(motor_count_6020_ == 0U) {
-    UNUSED(hw);
-    UNUSED(app);
     rls_.SetParamBounds({RLS_SPEED_LOSS_MIN, RLS_TORQUE_LOSS_MIN},
                         {RLS_SPEED_LOSS_MAX, RLS_TORQUE_LOSS_MAX});
     cached_budget_.effective_budget_w = SENTRY_OFFLINE_POWER_LIMIT_W;
@@ -410,7 +398,7 @@ class PowerControl : public LibXR::Application {
     return power_control_data_.supercap_online;
   }
 
-  void OnMonitor() override {}
+  void OnMonitor() {}
 
  private:
   static constexpr float DEFAULT_SPEED_LOSS = 0.22f;

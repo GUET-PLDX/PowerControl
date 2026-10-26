@@ -4,7 +4,7 @@
 /* === MODULE MANIFEST V2 ===
 module_description: RM2024 chassis power control with internal energy budget
 depends:
-- pldx/SuperPower@master
+- pldx/SuperPower@mc02-static
 === END MANIFEST === */
 // clang-format on
 

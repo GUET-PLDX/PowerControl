@@ -15,7 +15,7 @@
    供下一条新的超电功率遥测进行 RLS 更新。
 2. `SetMotorData3508/6020` 提交本周期请求电流、转速、跟踪误差和同一在线
    掩码；离线电机不参与分配且输出为零。
-3. `SetPowerRequest` 或 `SetBoostRequested` 选择 `Normal` / `Boost`。
+3. `SetBoostRequested` 选择 `Normal` / `Boost`。
 4. `OutputLimit()` 读取一次遥测，更新模型与能量预算，并对全部 M3508、
    GM6020 执行一次共享功率分配。
 5. `GetPowerControlData()` 返回限幅电流和诊断状态。

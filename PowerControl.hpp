@@ -346,26 +346,10 @@ class PowerControl {
     allocation_bias_3508_ = sanitized;
   }
 
-  void SetPowerRequest(PowerRequest power_request) {
-    LibXR::Mutex::LockGuard lock(data_mutex_);
-    requested_mode_ = power_request == PowerRequest::BOOST
-                          ? PowerRequest::BOOST
-                          : PowerRequest::NORMAL;
-  }
-
   void SetBoostRequested(bool boost_requested) {
-    SetPowerRequest(boost_requested ? PowerRequest::BOOST
-                                    : PowerRequest::NORMAL);
-  }
-
-  void SetMaxPowerConfigured(float max_power_w) {
     LibXR::Mutex::LockGuard lock(data_mutex_);
-    user_configured_max_power_w_ = max_power_w;
-  }
-
-  void RegisterPowerCallback(LibXR::Callback<float&> callback) {
-    LibXR::Mutex::LockGuard lock(data_mutex_);
-    power_callback_ = callback;
+    requested_mode_ =
+        boost_requested ? PowerRequest::BOOST : PowerRequest::NORMAL;
   }
 
   /** @brief 执行一次完整的同步功率控制周期。 */
@@ -916,20 +900,6 @@ class PowerControl {
 
     effective_budget =
         NonnegativeOr(effective_budget, CONSERVATIVE_FALLBACK_LIMIT_W);
-    float configured_limit = 0.0f;
-    LibXR::Callback<float&> power_callback;
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      configured_limit = user_configured_max_power_w_;
-      power_callback = power_callback_;
-    }
-    if (!power_callback.Empty()) {
-      configured_limit = 0.0f;
-      power_callback.Run(false, configured_limit);
-    }
-    if (std::isfinite(configured_limit) && configured_limit > 0.0f) {
-      effective_budget = std::min(effective_budget, configured_limit);
-    }
     status.effective_budget_w = effective_budget;
     return status;
   }
@@ -1342,8 +1312,6 @@ class PowerControl {
   LibXR::MicrosecondTimestamp last_control_timestamp_ = 0;
   bool control_timestamp_initialized_ = false;
   EnergyFeedbackDomain energy_feedback_domain_ = EnergyFeedbackDomain::NONE;
-  float user_configured_max_power_w_ = 0.0f;
-  LibXR::Callback<float&> power_callback_;
   BudgetStatus cached_budget_{};
   SuperPower::TelemetrySnapshot cached_telemetry_{};
   float cached_model_speed_loss_ = DEFAULT_SPEED_LOSS;

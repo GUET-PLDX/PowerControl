@@ -2,9 +2,11 @@
 
 #include <Eigen/Cholesky>
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 /**
@@ -21,12 +23,32 @@ class RLS {
   using ParamVector = Eigen::Matrix<float, DIMENSION, 1>;
   using Matrix = Eigen::Matrix<float, DIMENSION, DIMENSION>;
 
+  struct CovarianceSafety {
+    float max_trace = std::numeric_limits<float>::max();
+    float min_eigenvalue = 0.0f;
+  };
+
+  struct Diagnostics {
+    float covariance_trace = 0.0f;
+    uint32_t trace_limit_count = 0U;
+    uint32_t regularization_count = 0U;
+    uint32_t numerical_rejection_count = 0U;
+  };
+
   RLS() = delete;
 
   explicit RLS(float initial_covariance, float forgetting_factor,
                const ParamVector& initial_params = ParamVector::Zero())
+      : RLS(initial_covariance, forgetting_factor, initial_params,
+            CovarianceSafety{}) {}
+
+  explicit RLS(float initial_covariance, float forgetting_factor,
+               const ParamVector& initial_params, CovarianceSafety safety)
       : initial_covariance_(PositiveOr(initial_covariance, 1000.0f)),
-        forgetting_factor_(ValidForgettingFactor(forgetting_factor)) {
+        forgetting_factor_(ValidForgettingFactor(forgetting_factor)),
+        covariance_safety_(safety),
+        covariance_safety_valid_(
+            ValidCovarianceSafety(safety, initial_covariance_)) {
     Reset(initial_params);
   }
 
@@ -34,6 +56,12 @@ class RLS {
                const float (&initial_params)[DIMENSION])
       : RLS(initial_covariance, forgetting_factor,
             ParamVectorFromArray(initial_params)) {}
+
+  explicit RLS(float initial_covariance, float forgetting_factor,
+               const float (&initial_params)[DIMENSION],
+               CovarianceSafety safety)
+      : RLS(initial_covariance, forgetting_factor,
+            ParamVectorFromArray(initial_params), safety) {}
 
   /** @brief 重置参数和协方差。 */
   void Reset(const ParamVector& initial_params = ParamVector::Zero()) {
@@ -71,12 +99,18 @@ class RLS {
    * @return 更新被接受时返回 true；无效或退化样本返回 false。
    */
   bool Update(const ParamVector& sample, float actual_output) {
+    if (!covariance_safety_valid_) {
+      return RejectNumerical();
+    }
     if (!sample.allFinite() || !std::isfinite(actual_output)) {
-      return false;
+      return RejectNumerical();
     }
 
     const float EXCITATION = sample.squaredNorm();
-    if (!std::isfinite(EXCITATION) || EXCITATION <= 1.0e-12f) {
+    if (!std::isfinite(EXCITATION)) {
+      return RejectNumerical();
+    }
+    if (EXCITATION <= 1.0e-12f) {
       return false;
     }
 
@@ -84,7 +118,7 @@ class RLS {
     const float FULL_DENOMINATOR =
         forgetting_factor_ + sample.dot(FULL_COVARIANCE_TIMES_SAMPLE);
     if (!std::isfinite(FULL_DENOMINATOR) || FULL_DENOMINATOR <= 1.0e-12f) {
-      return false;
+      return RejectNumerical();
     }
 
     const ParamVector UNCONSTRAINED_GAIN =
@@ -94,7 +128,7 @@ class RLS {
     const ParamVector UNCONSTRAINED_DELTA = UNCONSTRAINED_GAIN * ERROR;
     if (!UNCONSTRAINED_GAIN.allFinite() || !std::isfinite(ERROR) ||
         !UNCONSTRAINED_DELTA.allFinite()) {
-      return false;
+      return RejectNumerical();
     }
 
     ParamVector free_mask = ParamVector::Ones();
@@ -119,13 +153,13 @@ class RLS {
     const float DENOMINATOR =
         forgetting_factor_ + FREE_SAMPLE.dot(FREE_COVARIANCE_TIMES_SAMPLE);
     if (!std::isfinite(DENOMINATOR) || DENOMINATOR <= 1.0e-12f) {
-      return false;
+      return RejectNumerical();
     }
 
     const ParamVector GAIN = FREE_COVARIANCE_TIMES_SAMPLE / DENOMINATOR;
     const ParamVector DELTA = GAIN * ERROR;
     if (!GAIN.allFinite() || !DELTA.allFinite()) {
-      return false;
+      return RejectNumerical();
     }
 
     ParamVector component_scale = ParamVector::Ones();
@@ -152,34 +186,31 @@ class RLS {
       }
       if (!std::isfinite(component_scale[index]) ||
           component_scale[index] < 0.0f) {
-        return false;
+        return RejectNumerical();
       }
     }
 
     const ParamVector EFFECTIVE_GAIN = GAIN.cwiseProduct(component_scale);
     const ParamVector CANDIDATE_PARAMS =
         ProjectParams(params_ + EFFECTIVE_GAIN * ERROR);
-    if (!(EFFECTIVE_GAIN.array().abs() > 0.0f).any() ||
-        !EFFECTIVE_GAIN.allFinite() || !CANDIDATE_PARAMS.allFinite()) {
+    if (!EFFECTIVE_GAIN.allFinite() || !CANDIDATE_PARAMS.allFinite()) {
+      return RejectNumerical();
+    }
+    if (!(EFFECTIVE_GAIN.array().abs() > 0.0f).any()) {
       return false;
     }
 
     const Matrix RETAINED_BLOCKED_COVARIANCE =
         (BLOCKED_SELECTOR * covariance_ * BLOCKED_SELECTOR).eval();
+    const Matrix JOSEPH_TRANSFORM =
+        Matrix::Identity() - EFFECTIVE_GAIN * FREE_SAMPLE.transpose();
     Matrix candidate_covariance =
-        (FREE_COVARIANCE -
-         EFFECTIVE_GAIN * FREE_SAMPLE.transpose() * FREE_COVARIANCE) /
+        (JOSEPH_TRANSFORM * FREE_COVARIANCE * JOSEPH_TRANSFORM.transpose()) /
             forgetting_factor_ +
+        EFFECTIVE_GAIN * EFFECTIVE_GAIN.transpose() +
         RETAINED_BLOCKED_COVARIANCE;
-    candidate_covariance =
-        (0.5f * (candidate_covariance + candidate_covariance.transpose()))
-            .eval();
-    if (!candidate_covariance.allFinite()) {
-      return false;
-    }
-    Eigen::LLT<Matrix> covariance_decomposition(candidate_covariance);
-    if (covariance_decomposition.info() != Eigen::Success) {
-      return false;
+    if (!ProtectCovariance(candidate_covariance)) {
+      return RejectNumerical();
     }
     params_ = CANDIDATE_PARAMS;
     covariance_ = candidate_covariance;
@@ -200,8 +231,102 @@ class RLS {
 
   const ParamVector& GetParamVector() const { return params_; }
 
+  const Matrix& GetCovariance() const { return covariance_; }
+
+  Diagnostics GetDiagnostics() const {
+    Diagnostics result = diagnostics_;
+    result.covariance_trace = covariance_.trace();
+    return result;
+  }
+
+  bool IsCovarianceSafetyValid() const { return covariance_safety_valid_; }
+
  private:
   static constexpr float MAX_PARAMETER_STEP_FRACTION = 0.05f;
+
+  static bool ValidCovarianceSafety(CovarianceSafety safety, float initial) {
+    const float INITIAL_TRACE = (Matrix::Identity() * initial).trace();
+    return std::isfinite(safety.max_trace) && safety.max_trace > 0.0f &&
+           std::isfinite(safety.min_eigenvalue) &&
+           safety.min_eigenvalue >= 0.0f &&
+           initial > 2.0f * safety.min_eigenvalue &&
+           std::isfinite(INITIAL_TRACE) && INITIAL_TRACE <= safety.max_trace;
+  }
+
+  static void Increment(uint32_t& counter) {
+    if (counter < std::numeric_limits<uint32_t>::max()) {
+      ++counter;
+    }
+  }
+
+  bool RejectNumerical() {
+    Increment(diagnostics_.numerical_rejection_count);
+    return false;
+  }
+
+  static bool PositiveAbove(const Matrix& covariance, float minimum) {
+    Matrix shifted = covariance;
+    shifted.diagonal().array() -= minimum;
+    return shifted.allFinite() &&
+           Eigen::LLT<Matrix>(shifted).info() == Eigen::Success;
+  }
+
+  bool ProtectCovariance(Matrix& covariance) {
+    covariance = (0.5f * covariance + 0.5f * covariance.transpose()).eval();
+    if (!covariance.allFinite() || !std::isfinite(covariance.trace())) {
+      return false;
+    }
+
+    const float FLOOR = covariance_safety_.min_eigenvalue;
+    if (!PositiveAbove(covariance, 2.0f * FLOOR)) {
+      if (FLOOR == 0.0f) {
+        return false;
+      }
+      covariance.diagonal().array() += 4.0f * FLOOR;
+      Increment(diagnostics_.regularization_count);
+      if (!PositiveAbove(covariance, 2.0f * FLOOR)) {
+        return false;
+      }
+    }
+
+    if (covariance.trace() > covariance_safety_.max_trace) {
+      Eigen::SelfAdjointEigenSolver<Matrix> decomposition;
+      if constexpr (DIMENSION == 2U || DIMENSION == 3U) {
+        decomposition.computeDirect(covariance);
+      } else {
+        decomposition.compute(covariance);
+      }
+      if (decomposition.info() != Eigen::Success ||
+          !decomposition.eigenvalues().allFinite() ||
+          !decomposition.eigenvectors().allFinite()) {
+        return false;
+      }
+      ParamVector eigenvalues = decomposition.eigenvalues();
+      // Cap the largest eigenvalues first, retaining smaller informed
+      // directions.
+      float remaining = covariance_safety_.max_trace *
+                        (1.0f - 8.0f * std::numeric_limits<float>::epsilon());
+      for (std::size_t index = 0U; index < DIMENSION; ++index) {
+        const float CAP = remaining / static_cast<float>(DIMENSION - index);
+        if (eigenvalues[index] > CAP) {
+          for (std::size_t j = index; j < DIMENSION; ++j) {
+            eigenvalues[j] = CAP;
+          }
+          break;
+        }
+        remaining -= eigenvalues[index];
+      }
+      covariance = (decomposition.eigenvectors() * eigenvalues.asDiagonal() *
+                    decomposition.eigenvectors().transpose())
+                       .eval();
+      covariance = (0.5f * covariance + 0.5f * covariance.transpose()).eval();
+      Increment(diagnostics_.trace_limit_count);
+    }
+
+    return covariance.allFinite() && std::isfinite(covariance.trace()) &&
+           covariance.trace() <= covariance_safety_.max_trace &&
+           PositiveAbove(covariance, FLOOR);
+  }
 
   static float PositiveOr(float value, float fallback) {
     return std::isfinite(value) && value > 0.0f ? value : fallback;
@@ -227,6 +352,9 @@ class RLS {
 
   float initial_covariance_;
   float forgetting_factor_;
+  CovarianceSafety covariance_safety_;
+  bool covariance_safety_valid_;
+  Diagnostics diagnostics_{};
   ParamVector lower_bounds_ =
       ParamVector::Constant(-std::numeric_limits<float>::max());
   ParamVector upper_bounds_ =

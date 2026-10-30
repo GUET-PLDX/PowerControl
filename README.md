@@ -32,6 +32,25 @@ RLS 只消费反馈数据，每个 `chassis_power_sequence` 最多尝试一次�
 受限恢复更新；短暂超电离线或无效样本不会立即清空证据，超过有效期才重置。
 GM6020 的固定模型功率和底盘静态损耗会先从实测功率中扣除。
 
+底盘 RLS 使用受限增益的 Joseph 协方差更新、对角正则化和迹上限。
+初始协方差为 `1e-5 I`，迹上限为 `1e-3`，正定裕量为 `1e-9`；这两个
+保护阈值应结合实车数据标定。候选协方差经过正定性和有限性检查后才与候选参数
+一起提交，检查失败时沿用上一组可信状态。迹限幅优先压缩较大的特征值，
+以减少对已有辨识信息的影响。
+
+`GetPowerControlData().rls_diagnostics` 提供当前协方差迹，以及迹限幅、
+正则化和数值拒绝次数。计数按操作尝试累计，达到 `uint32_t` 上限后饱和；
+协方差重置不会清零计数。激励不足等正常跳过不计为数值拒绝。
+
+主机端数值回归和功率控制集成测试：
+
+```sh
+python3 -m unittest discover -s Modules/GUET-PLDX/PowerControl/tests -v
+cmake -S Modules/GUET-PLDX/PowerControl/tests -B /tmp/power-control-tests -G Ninja
+cmake --build /tmp/power-control-tests
+ctest --test-dir /tmp/power-control-tests --output-on-failure
+```
+
 ## 内部预算
 
 模块内部固定使用 RM2024 的基础/满能量双环，并直接持有两个

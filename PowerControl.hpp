@@ -204,6 +204,7 @@ struct PowerControlData {
   bool referee_energy_buffer_online = false;
   bool referee_online = false;
   bool rls_updated = false;
+  RLS<2>::Diagnostics rls_diagnostics{};
   DegradationReason degradation_reason =
       DegradationReason::INVALID_REFEREE_LIMIT;
   PowerRequest requested_mode = PowerRequest::NORMAL;
@@ -233,7 +234,8 @@ class PowerControl {
         base_energy_pid_(MakeEnergyPidParam()),
         full_energy_pid_(MakeEnergyPidParam()),
         rls_(RLS_INITIAL_COVARIANCE, RLS_FORGETTING_FACTOR,
-             {DEFAULT_SPEED_LOSS, DEFAULT_TORQUE_SQUARE_LOSS}),
+             {DEFAULT_SPEED_LOSS, DEFAULT_TORQUE_SQUARE_LOSS},
+             {RLS_MAX_COVARIANCE_TRACE, RLS_MIN_COVARIANCE_EIGENVALUE}),
         chassis_static_power_loss_(
             NonnegativeOr(chassis_static_power_loss, 2.78f)),
         reduction_ratio_3508_(reduction_ratio_3508),
@@ -253,6 +255,8 @@ class PowerControl {
     cached_budget_.degradation_reason = DegradationReason::BOTH_OFFLINE;
     cached_model_speed_loss_ = DEFAULT_SPEED_LOSS;
     cached_model_torque_square_loss_ = DEFAULT_TORQUE_SQUARE_LOSS;
+    cached_rls_diagnostics_ = rls_.GetDiagnostics();
+    power_control_data_.rls_diagnostics = cached_rls_diagnostics_;
     thread_.Create(this, ThreadFunc, "PowerTask", 2048,
                    LibXR::Thread::Priority::MEDIUM);
   }
@@ -405,6 +409,10 @@ class PowerControl {
   static constexpr float DEFAULT_CONTROL_PERIOD_S = 0.001f;
   static constexpr float RLS_INITIAL_COVARIANCE = 1.0e-5f;
   static constexpr float RLS_FORGETTING_FACTOR = 0.99999f;
+  static constexpr float RLS_MAX_COVARIANCE_TRACE = 1.0e-3f;
+  static constexpr float RLS_MIN_COVARIANCE_EIGENVALUE = 1.0e-9f;
+  static_assert(2.0f * RLS_INITIAL_COVARIANCE < RLS_MAX_COVARIANCE_TRACE);
+  static_assert(RLS_INITIAL_COVARIANCE > 2.0f * RLS_MIN_COVARIANCE_EIGENVALUE);
   static constexpr float RLS_MIN_SUM_ABS_OMEGA = 20.0f;
   static constexpr float RLS_MIN_SUM_TAU_SQUARED = 0.02f;
   static constexpr float RLS_MIN_INNOVATION_LIMIT_W = 30.0f;
@@ -488,6 +496,7 @@ class PowerControl {
     BudgetStatus cached_budget{};
     SuperPower::TelemetrySnapshot telemetry{};
     bool rls_updated = false;
+    RLS<2>::Diagnostics rls_diagnostics{};
     PowerControlData output{};
   };
 
@@ -642,6 +651,7 @@ class PowerControl {
     workspace.cached_budget = cached_budget_;
     workspace.telemetry = cached_telemetry_;
     workspace.rls_updated = rls_updated_cache_;
+    workspace.rls_diagnostics = cached_rls_diagnostics_;
     if (consume_feedback) {
       feedback_ready_3508_ = false;
       feedback_ready_6020_ = false;
@@ -1215,6 +1225,7 @@ class PowerControl {
       cached_model_speed_loss_ = PARAMS[0];
       cached_model_torque_square_loss_ = PARAMS[1];
       rls_updated_cache_ = RLS_UPDATED;
+      cached_rls_diagnostics_ = rls_.GetDiagnostics();
     }
   }
 
@@ -1272,6 +1283,7 @@ class PowerControl {
     workspace_.output.referee_online = telemetry.referee_power_limit_online &&
                                        telemetry.referee_energy_buffer_online;
     workspace_.output.rls_updated = workspace_.rls_updated;
+    workspace_.output.rls_diagnostics = workspace_.rls_diagnostics;
     workspace_.output.degradation_reason = budget_status.degradation_reason;
     workspace_.output.requested_mode = workspace_.requested_mode;
 
@@ -1319,6 +1331,7 @@ class PowerControl {
   float estimated_cap_energy_j_ = 0.0f;
   float estimated_power_w_ = 0.0f;
   bool rls_updated_cache_ = false;
+  RLS<2>::Diagnostics cached_rls_diagnostics_{};
   Workspace background_workspace_{};
   Workspace workspace_{};
   PowerControlData power_control_data_{};
